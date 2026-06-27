@@ -224,7 +224,7 @@ ExecStart=/usr/local/bin/tempo node \
   --datadir /var/lib/tempo \
   --http --http.addr 0.0.0.0 --http.port 8545 \
   --http.api eth,net,web3,txpool,debug,trace,tempo,operator \
-  --ws --ws.addr 0.0.0.0 --ws.port 8545 \
+  --ws --ws.addr 0.0.0.0 --ws.port 8546 \
   --consensus.signing-key /etc/tempo/signing.key \
   --consensus.signing-share /etc/tempo/signing.share \
   --consensus.listen-address 0.0.0.0:8000 \
@@ -251,7 +251,7 @@ Start remaining validators with their unique `signing.key` and `signing.share`. 
 Sync from an upstream validator without participating in consensus:
 
 ```bash
-tempo node --follow wss://validator-a.example.com:8545 \
+tempo node --follow wss://validator-a.example.com:8546 \
   --chain /etc/tempo/genesis.json \
   --datadir /var/lib/tempo \
   --consensus.signing-key /etc/tempo/signing.key \
