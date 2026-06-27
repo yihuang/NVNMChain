@@ -287,6 +287,113 @@ cast send 0xCCCCCCCC00000000000000000000000000000001 \
 
 Deactivation is effective at the next epoch boundary after the DKG reshare.
 
+## Consensus Network Configuration
+
+### Timing Budgets
+
+The consensus layer uses a pipelined view-change protocol where each view has a leader, a proposal window, and a notarization window. These parameters must be tuned together:
+
+```
+┌──────────────────────────────────────────────────► time
+│
+├── Proposal Window ──┤├── Notarization Window ──┤├── Next View
+│  wait-for-proposal   │  wait-for-notarizations   │
+│                      │                           │
+│◄── network-budget ──►│                           │
+│◄──── target-block-time ─────────────────────────►│
+```
+
+| Scenario | `target-block-time` | `wait-for-proposal` | `wait-for-notarizations` | `network-budget` |
+|---|---|---|---|---|
+| Same-region (≤5ms RTT) | `500ms` | `1200ms` | `1000ms` | `50ms` |
+| Cross-region (50ms RTT) | `2s` | `4s` | `3s` | `200ms` |
+| Geo-distributed (100ms RTT) | `4s` | `8s` | `6s` | `500ms` |
+
+**Rules of thumb:**
+
+- `wait-for-proposal` should be ≥ `target-block-time × 2` to account for network jitter on the leader's proposal broadcast.
+- `wait-for-notarizations` should be ≥ `target-block-time × 1.5` to give followers time to propagate notarizations.
+- `network-budget` should be `2 × P95 RTT` between any two validators — this is the time reserved for proposal propagation before the local build deadline.
+- `target-block-time` minimum is constrained by: `time-to-build-subblock (100ms) + network-budget + 2 × P95 RTT`. Running below this causes view timeouts in healthy conditions.
+- `synchrony-bound` must be ≥ `target-block-time` and at least `2s` to tolerate NTP skew. Tighten only with hardware PTP clocks.
+
+### Subblock Construction
+
+Subblocks are partial proposals that the next leader collects before assembling the final block:
+
+| Argument | Default | Recommendation |
+|---|---|---|
+| `--consensus.time-to-build-subblock` | `100ms` | Keep at `100ms` for most deployments. Reduce to `50ms` only at sub-`500ms` block times |
+| `--consensus.subblock-broadcast-interval` | `50ms` | Keep at `50ms`. Each subblock is rebroadcast at this interval to the next proposer |
+
+### Epoch Configuration
+
+The chain's epoch length is set in genesis (`--epoch-length`). Epoch boundaries trigger DKG reshare:
+
+| Epoch length | At 0.5s blocks | At 2s blocks | Use case |
+|---|---|---|---|
+| `302_400` | ~7 days | ~7 days | Default. Balances DKG overhead against validator set reactivity |
+| `86_400` | ~12 hours | ~2 days | Frequent node churn; smaller sets converge faster |
+| `1_209_600` | ~7 days | ~28 days | Stable validator set; minimize DKG ceremony frequency |
+
+The DKG ceremony runs in the background over 3–5 views (~1–25 seconds depending on block time). It does not halt block production during reshare.
+
+### Worker and Channel Tuning
+
+| Argument | Default | Recommendation |
+|---|---|---|
+| `--consensus.worker-threads` | `3` | `4`–`8` for high-throughput. Each handles: network I/O, crypto, storage. Monitor CPU; if `tempo_consensus_view` lags behind wall clock, increase |
+| `--consensus.message-backlog` | `16384` | Sufficient for all tested loads. Increase to `32768` for 10k+ validator sets |
+| `--consensus.mailbox-size` | `16384` | Match to `message-backlog` |
+| `--consensus.deque-size` | `10` | Increase to `20`–`50` for high-latency networks with frequent backfill |
+| `--consensus.views-to-track` | `256` | At `550ms` block time this is ~140s of activity window. Increase for slower networks |
+| `--consensus.inactive-views-until-leader-skip` | `32` | At `550ms` this is ~17s before a lagging validator is skipped as leader. Increase for geo-deployed networks |
+
+### Network Security Hardening
+
+Tempo's consensus P2P layer uses commonware with TLS-authenticated connections. Production defaults are aggressive:
+
+| Argument | Default | Effect |
+|---|---|---|
+| `--consensus.bypass-ip-check` | `false` | **Must remain `false` in production.** Rejects handshakes from IPs not matching the validator's on-chain ingress/egress |
+| `--consensus.allow-dns` | `true` | Allows DNS hostnames in ingress/egress fields — useful behind load balancers |
+| `--consensus.allow-private-ips` | `false` | Enable for VPC-only deployments where validators communicate over RFC1918 addresses |
+| `--consensus.handshake-per-ip-min-period` | `5s` | Limits handshake attempts per source IP. Tighten to `30s` if under volumetric attack |
+| `--consensus.max-concurrent-handshakes` | `512` | Caps TLS handshake concurrency. Reduce to `128` under resource constraints |
+| `--consensus.time-to-unblock-byzantine-peer` | `4h` | Ban duration for misbehaving or unresponsive peers |
+| `--consensus.connection-per-peer-min-period` | `60s` | Minimum interval between reconnect attempts to the same peer |
+| `--consensus.handshake-per-subnet-min-period` | `15ms` | Per-/24 rate limit. Leave at `15ms` to avoid collateral blocking in shared infrastructure |
+
+### Validator IP Obfuscation
+
+Tempo does not have a built-in sentry proxy. To hide a validator's real IP:
+
+1. **Set ingress/egress to a load balancer IP or DNS name** when calling `addValidator` or `setIpAddresses` on the `ValidatorConfigV2` precompile.
+2. **Place the validator in a private subnet** — it outbound-connects to peers using their on-chain addresses. The LB forwards incoming consensus connections.
+3. **Restrict the validator's firewall** to only accept connections from the LB's source IP range.
+4. **Verify** with `--consensus.bypass-ip-check false` — if the on-chain ingress doesn't match the LB's source IP, commonware rejects the handshake.
+
+```
+Internet ──► Load Balancer ──► Validator (P2P port 8000)
+              (ingress in          │
+               ValidatorConfigV2)  │ outbound peers dialed
+                                   ▼ directly from on-chain
+                               Peer A, Peer B, ...
+```
+
+### Leader Selection and View-Timeouts
+
+Consensus uses a VRF-based leader election over the validator BLS public key set. Every view has a deterministic leader per round. If the leader fails to propose within `wait-for-proposal`, validators broadcast a nullify and advance to the next view.
+
+High view-change rates indicate network or configuration issues:
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Frequent `tempo_consensus_view` increments without proposals | `wait-for-proposal` too short for network RTT | Increase by 2× P95 RTT |
+| Stuttering block production but low view changes | `network-budget` too small; proposal returns late | Increase `network-budget` |
+| Validator frequently skipped as leader (`inactive-views-until-leader-skip` exhausted) | Node is slower than peers or under-resourced | Check CPU, disk IO, or increase `inactive-views-until-leader-skip` |
+| Spikes in view changes during DKG epochs | DKG ceremony competing with proposal CPU | Increase `worker-threads` temporarily |
+
 ## Monitoring
 
 ### Consensus Metrics
