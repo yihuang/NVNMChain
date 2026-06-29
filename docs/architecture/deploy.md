@@ -394,6 +394,177 @@ High view-change rates indicate network or configuration issues:
 | Validator frequently skipped as leader (`inactive-views-until-leader-skip` exhausted) | Node is slower than peers or under-resourced | Check CPU, disk IO, or increase `inactive-views-until-leader-skip` |
 | Spikes in view changes during DKG epochs | DKG ceremony competing with proposal CPU | Increase `worker-threads` temporarily |
 
+## Fee Tokens and Fee AMM
+
+### Built-in Fee Tokens
+
+Gen 0 genesis creates four USD-denominated TIP-20 tokens with deterministic vanity addresses:
+
+| Token | Address | Role |
+|---|---|---|
+| **PathUSD** | `0x20C0000000000000000000000000000000000000` | Default fee token. Used as fallback when no user/validator preference is set |
+| **AlphaUSD** | `0x20C0000000000000000000000000000000000001` | Extra token; created unless `--no-extra-tokens` |
+| **BetaUSD** | `0x20C0000000000000000000000000000000000002` | Same |
+| **ThetaUSD** | `0x20C0000000000000000000000000000000000003` | Same |
+
+All built-in tokens are initially minted to every genesis account with `u64::MAX` balance. `quoteToken` of every token points to PathUSD, enabling two-hop fee routing through a single PathUSD pair instead of requiring every `(userToken, validatorToken)` pair to have direct liquidity.
+
+AlphaUSD/BetaUSD/ThetaUSD are demonstration tokens. **For production**, supply your own stablecoin TIP-20 tokens via `TIP20Factory` and disable the built-in extras with `--no-extra-tokens`.
+
+### Custom Fee Tokens
+
+TIP-20 tokens are created through the `TIP20Factory` precompile (`0x20FC0000...`). A token only qualifies as a fee token if it has a verified USD currency (`validate_usd_currency`).
+
+```solidity
+// Call TIP20Factory to create a new TIP-20 token
+ITIP20Factory(0x20FC000000000000000000000000000000000000).createToken(
+    "USD Coin",        // name
+    "USDC",            // symbol
+    6,                 // decimals
+    1000000000000      // initial supply
+)
+```
+
+The returned address is deterministic from the factory's CREATE2 logic (derived from salt = `tokenId`). USD currency verification requires:
+
+1. The token's `currency()` matches one of the recognized stablecoin codes (USD, EUR, JPY, etc.)
+2. Decimals ≤ 18
+3. The token is registered in `TIP20Factory` (i.e., created through the factory)
+
+### Fee AMM (TIPFeeAMM)
+
+The Fee AMM is a constant-product stablecoin AMM co-located with the `TipFeeManager` precompile (`0xFEEC0000...`). It automatically converts user-paid fees to each validator's preferred token.
+
+#### How Fee Payment Works
+
+```
+User Transaction
+    │
+    ▼
+1. collect_fee_pre_tx(user_token, gas_price, gas_limit)
+    ├── UserToken == ValidatorToken? → direct transfer (no swap)
+    └── UserToken ≠ ValidatorToken? → AMM swap through TIPFeeAMM
+         ├── Direct pool (userToken, validatorToken) has liquidity
+         │   → swap and transfer
+         └── No direct pool
+             → two-hop: userToken → quoteToken → validatorToken
+
+2. [EVM Execution]
+
+3. collect_fee_post_tx(actual_spending) → refund unused fee
+4. Validator calls distributeFees() → claims accumulated fees
+```
+
+#### Set Up Liquidity Pools
+
+Each `(userToken, validatorToken)` pair needs a liquidity pool. Liquidity is provided via `mint` on the precompile:
+
+```solidity
+// Approve token transfer first
+ITIP20(userToken).approve(0xFEEC..., amount);
+
+// Add liquidity
+ITIPFeeAMM(0xFEEC000000000000000000000000000000000000).mint(
+    address userToken,
+    address validatorToken,
+    uint256 amountValidatorToken,    // amount of validatorToken to add
+    address to                        // receives LP tokens
+);
+```
+
+The AMM uses a constant-product formula with a 0.25% fee (`FEE_BPS = 25`). Key parameters:
+
+| Parameter | Value |
+|---|---|
+| `M` (reserve ratio numerator) | `1` |
+| `N` (reserve ratio denominator) | `1` |
+| `SCALE` | `1e18` |
+| `MIN_LIQUIDITY` | `1000` |
+
+#### User Token Preference
+
+Each user can set their preferred fee token (defaults to PathUSD if unset):
+
+```bash
+cast send 0xFEEC000000000000000000000000000000000000 \
+  "setUserToken(address)" <TOKEN_ADDRESS> \
+  --rpc-url <RPC_URL> --private-key <USER_KEY>
+#
+# Read current preference
+cast call 0xFEEC000000000000000000000000000000000000 \
+  "userTokens(address)" <USER_ADDRESS> \
+  --rpc-url <RPC_URL>
+```
+
+#### Validator Token Preference
+
+Each validator sets their preferred fee token (where they receive fees). Defaults to PathUSD if unset:
+
+```bash
+cast send 0xFEEC000000000000000000000000000000000000 \
+  "setValidatorToken(address)" <TOKEN_ADDRESS> \
+  --rpc-url <RPC_URL> --private-key <VALIDATOR_KEY>
+#
+# Read current preference
+cast call 0xFEEC000000000000000000000000000000000000 \
+  "validatorTokens(address)" <VALIDATOR_ADDRESS> \
+  --rpc-url <RPC_URL>
+```
+
+Tokens must be:
+- Registered in `TIP20Factory` (created through the factory)
+- USD-denominated (validated by the TIP-20 token's `currency()`)
+
+#### Distribute Fees
+
+Validators (or any caller) can trigger fee distribution:
+
+```bash
+cast send 0xFEEC000000000000000000000000000000000000 \
+  "distributeFees(address,address)" <VALIDATOR> <TOKEN> \
+  --rpc-url <RPC_URL> --private-key <KEY>
+```
+
+This transfers all accumulated fees for `(validator, token)` to the validator's address. Accumulated fees are viewable via:
+
+```bash
+cast call 0xFEEC000000000000000000000000000000000000 \
+  "collectedFees(address,address)" <VALIDATOR> <TOKEN> \
+  --rpc-url <RPC_URL>
+```
+
+#### Two-Hop Routing (TIP-1033, T5+)
+
+When the direct `(userToken, validatorToken)` pool has insufficient liquidity, the Fee AMM falls back to a two-hop route through `userToken.quoteToken()`. This means only `(userToken, quoteToken)` and `(quoteToken, validatorToken)` pools need liquidity, not every `(N×M)` pair.
+
+In genesis, all built-in tokens have `quoteToken = PathUSD`, so:
+
+```
+USDC (user) → PathUSD → EURC (validator)
+```
+
+requires only:
+- `(USDC, PathUSD)` pool — has liquidity from `--no-pairwise-liquidity` remaining enabled
+- `(PathUSD, EURC)` pool — must be created separately via `mint`
+
+### Deploying a Custom Stablecoin Chain
+
+Minimal genesis command for a production chain with a single custom fee token:
+
+```bash
+cargo run --profile maxperf -p tempo-xtask -- generate-genesis \
+  --output /etc/tempo/genesis \
+  --no-extra-tokens \
+  --deployment-gas-token \
+  --deployment-gas-token-admin <ADMIN_ADDRESS> \
+  -a <ACCOUNT_COUNT> \
+  --chain-id <CHAIN_ID> \
+  --validators <VALIDATOR_LIST> \
+  --epoch-length 302400
+```
+
+This creates only PathUSD (for system operations) and the deployment gas token `DONOTUSE` (for genesis account funding). All users and validators set their own fee tokens at runtime via `setUserToken`/`setValidatorToken`, and liquidity providers add AMM pools on demand via `mint`.
+
 ## Monitoring
 
 ### Consensus Metrics
