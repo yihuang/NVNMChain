@@ -565,6 +565,124 @@ cargo run --profile maxperf -p tempo-xtask -- generate-genesis \
 
 This creates only PathUSD (for system operations) and the deployment gas token `DONOTUSE` (for genesis account funding). All users and validators set their own fee tokens at runtime via `setUserToken`/`setValidatorToken`, and liquidity providers add AMM pools on demand via `mint`.
 
+## Cross-Chain Bridging
+
+Tempo has no built-in bridge. All cross-chain transfers must be routed through external bridge protocols (LayerZero, Hyperlane, Wormhole, CCIP). The protocol provides the primitives for safe bridge integration.
+
+### TIP-20 Bridge Primitives
+
+| Primitive | TIP | Purpose |
+|---|---|---|
+| `burnAt(from, amount)` | TIP-1006 | Burn tokens from any address. Requires `BURN_AT_ROLE`. Designed for ERC-7802 (`crosschainBurn`) compatibility |
+| `mint(to, amount)` / `mintWithMemo(to, amount, memo)` | TIP-20 | Mint tokens on destination. Requires `ISSUER_ROLE` |
+| `setLogoURI(uri)` | TIP-20 | Set token metadata for bridge frontends |
+
+`burnAt` is not yet implemented (status: Backlog). Current workaround: use the existing `burn(amount)` (self-burn, requires `ISSUER_ROLE`) or `burnBlocked(from, amount)` (requires `BURN_BLOCKED_ROLE`, only works on policy-blocked addresses).
+
+### Replay Protection
+
+Every signed object in the protocol binds to `chainId`:
+
+| Component | Binding | Replay prevention |
+|---|---|---|
+| TempoTransaction `chain_id` field | `encode_for_signing` includes chainId | Cross-chain tx replay blocked at signature verification |
+| KeyAuthorization `chain_id` | T1C+: exact match required. Pre-T1C: `0` = wildcard allowed | AdminKey replay across chains |
+| ValidatorConfigV2 `addValidatorMessage` | `keccak256(chainId \|\| contractAddress \|\| ...)` | Cross-chain validator registration replay |
+
+### Bridge Architecture
+
+A standard setup uses **PathUSD** (`0x20C00000...`) as the canonical bridge token:
+
+```
+Tempo Chain A                     Tempo Chain B
+┌─────────────────┐              ┌─────────────────┐
+│  Bridge Contract │  lock/burn  │  Bridge Contract │
+│  (e.g. OFT)      │◄──────────►│  (e.g. OFT)      │
+│                  │  mint/unlock│                  │
+│  holds PathUSD   │  relay      │  mints PathUSD   │
+└─────────────────┘              └─────────────────┘
+         │                              │
+         └────────── Relayer ───────────┘
+               (oracle, light client,
+                multisig, or ZK proof)
+```
+
+### Integration Steps for Each Bridge Protocol
+
+**1. Deploy the bridge's token wrapper on Tempo**
+
+Each bridge protocol requires a wrapper contract around the TIP-20 token:
+
+```solidity
+// Example: LayerZero OFT adapter wrapping PathUSD
+contract OFTAdapter is OFT {
+    TIP20 public immutable pathUSD;
+
+    function _debit(address from, uint256 amount, bytes memory) internal override returns (uint256) {
+        // burnAt(from, amount) — requires BURN_AT_ROLE on PathUSD
+        pathUSD.burnAt(from, amount);
+        return amount;
+    }
+
+    function _credit(address to, uint256 amount, bytes memory) internal override {
+        pathUSD.mint(to, amount);
+    }
+}
+```
+
+**2. Create liquidity for bridged tokens on the Fee AMM**
+
+When bridged tokens arrive on a Tempo chain, they need Fee AMM liquidity for users to pay gas:
+
+```bash
+# Add PathUSD → native token pool
+cast send 0xFEEC000000000000000000000000000000000000 \
+  "mint(address,address,uint256,address)" \
+  0x20C0000000000000000000000000000000000000 \  # source (PathUSD)
+  0x20C0000000000000000000000000000000000000 \  # target (same = no swap needed)
+  <AMOUNT> \
+  <LP_RECIPIENT> \
+  --rpc-url <RPC_URL> --private-key <KEY>
+```
+
+**3. Set the bridged token as default fee token** (optional)
+
+If the bridged stablecoin should be the canonical fee token:
+
+```bash
+# Set for all validators
+cast send 0xFEEC000000000000000000000000000000000000 \
+  "setValidatorToken(address)" <BRIDGED_TOKEN> \
+  --rpc-url <RPC_URL> --private-key <VALIDATOR_KEY>
+
+# Optional: set as default user token
+cast send 0xFEEC000000000000000000000000000000000000 \
+  "setUserToken(address)" <BRIDGED_TOKEN> \
+  --rpc-url <RPC_URL> --private-key <USER_KEY>
+```
+
+**4. Configure the bridge relayer**
+
+The relayer monitors Tempo for `Transfer(burner, address(0), amount)` or custom `BurnAt` events, and mints on the destination. Standard bridge protocols handle this; Tempo provides no native relayer.
+
+### Recommended Bridge Protocols
+
+Tempo is EVM-compatible (Osaka hardfork target), so any EVM bridge protocol works:
+
+| Protocol | Integration path | Notes |
+|---|---|---|
+| LayerZero | `OFT` | Deploy `OFTAdapter` wrapping TIP-20. Uses UltraLight Node + oracles |
+| Hyperlane | `HypERC20` | Deploy `HypERC20` with `mailbox` pointing to Tempo's Hyperlane mailbox contract |
+| Wormhole | NFT/Bridge | Integrate via Wormhole's token bridge. Requires deploying bridge contracts on Tempo |
+| CCIP | TokenPool | Deploy a `TokenPool` that calls `burnAt`/`mint` |
+| IBC (Composable) | csr-token | Requires a light client contract for Tempo on the counterparty |
+
+### Bridging Validator Set (Interchain Security)
+
+Tempo has no IBC or ICS. Each chain has its own `ValidatorConfigV2` contract and independent validator set. Cross-chain validator rotation is not possible through the protocol — validators must be added/removed independently on each chain.
+
+The `chainId` embedded in `addValidatorMessage` and `rotateValidatorMessage` prevents a validator registration from one Tempo chain from being replayed on another.
+
 ## Monitoring
 
 ### Consensus Metrics
