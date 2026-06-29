@@ -193,6 +193,78 @@ Reth-standard arguments apply. Key overrides:
 
 Exposes `tempo_fundAddress` RPC. **Not for production.**
 
+### 4. Config File
+
+#### Execution Layer: reth TOML Config
+
+Reth-based flags (database, RPC, P2P, mempool, tracing) support a TOML config file via `--config`:
+
+```toml
+# /etc/tempo/config.toml
+[peers]
+trusted_only = true
+
+[rpc]
+eth_apis = ["eth", "net", "web3", "txpool", "debug", "trace", "tempo", "operator"]
+
+[http]
+addr = "0.0.0.0"
+port = 8545
+
+[ws]
+addr = "0.0.0.0"
+port = 8546
+
+[metrics]
+addr = "0.0.0.0"
+port = 9001
+
+[builder]
+deadline = 3
+
+[stages]
+[stages.types]
+full = { pruning = true }
+```
+
+Usage:
+
+```bash
+tempo node --config /etc/tempo/config.toml \
+  --chain /etc/tempo/genesis.json \
+  --consensus.signing-key /etc/tempo/signing.key \
+  --consensus.signing-share /etc/tempo/signing.share \
+  --consensus.listen-address 0.0.0.0:8000
+```
+
+Most reth flags also accept environment variables prefixed with `RETH_` or `TEMPO_` (check `--help` per flag). Known Tempo-specific env vars:
+
+| Env var | Equivalent flag |
+|---|---|
+| `TEMPO_FOLLOW` | `--follow` |
+| `TEMPO_BOOTNODES_ENDPOINT` | `--bootnodes-endpoint` |
+
+#### Consensus Layer: CLI Flags Only
+
+Tempo-specific `--consensus.*` flags have **no config file** and **no environment variable** equivalents beyond those listed above. They must be passed as CLI arguments.
+
+Workaround — store flags in a shell wrapper:
+
+```bash
+# /usr/local/bin/tempo-validator.sh
+#!/bin/bash
+exec /usr/local/bin/tempo node \
+  --config /etc/tempo/config.toml \
+  --chain /etc/tempo/genesis.json \
+  --consensus.signing-key /etc/tempo/signing.key \
+  --consensus.signing-share /etc/tempo/signing.share \
+  --consensus.listen-address 0.0.0.0:8000 \
+  --consensus.target-block-time 550ms \
+  --consensus.wait-for-proposal 1200ms \
+  --consensus.allow-private-ips \
+  "$@"
+```
+
 ## Deployment Procedure
 
 ### Bootstrap Phase
